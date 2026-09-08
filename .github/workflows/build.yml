@@ -1,0 +1,131 @@
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      src_ref:
+        description: 'ref to build (branch/tag)'
+        required: false
+        default: 'v296-rlsfix'
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        env:
+          SRC_TOKEN: ${{ secrets.SRC_TOKEN }}
+          SRC_REPO: ${{ secrets.SRC_REPO }}
+        run: |
+          SRC_REF="${{ github.event.inputs.src_ref || 'v296-rlsfix' }}"
+          git clone --depth 1 -b "$SRC_REF" "https://x-access-token:${SRC_TOKEN}@github.com/${SRC_REPO}.git" .
+          echo "building src_ref=$SRC_REF"
+          echo "SRC_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          echo "cloned at $(git rev-parse --short HEAD)"
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Cache OpenCV 4.7.0 static libs (iOS arm64)
+        id: cache-opencv
+        uses: actions/cache@v4
+        with:
+          path: ThirdParty/opencv
+          key: opencv-ios-4.7.0
+
+      - name: Build OpenCV 4.7.0 (if not cached)
+        if: steps.cache-opencv.outputs.cache-hit != 'true'
+        run: bash scripts/build_opencv_ios.sh
+
+      - name: Cache ncnn static libs (iOS arm64)
+        id: cache-ncnn
+        uses: actions/cache@v4
+        with:
+          path: ThirdParty/ncnn
+          key: ncnn-ios-20250916-v2
+
+      - name: Build ncnn (if not cached)
+        if: steps.cache-ncnn.outputs.cache-hit != 'true'
+        run: bash scripts/build_ncnn_ios.sh
+
+      - name: Cache tesseract static libs (iOS arm64)
+        id: cache-tesseract
+        uses: actions/cache@v4
+        with:
+          path: |
+            ThirdParty/tesseract
+            ThirdParty/leptonica
+          key: tesseract-ios-5.5.0-lept-1.85.0-v2
+
+      - name: Build tesseract 5.5.0 + leptonica 1.85.0 (if not cached)
+        if: steps.cache-tesseract.outputs.cache-hit != 'true'
+        run: bash scripts/build_tesseract_ios.sh
+
+      - name: Build + Sign + Package
+        run: |
+          make all
+
+      - name: Verify entitlements
+        run: |
+          APP_DIR=$(ls -d build/*.app | head -1)
+          APP_BIN=$(basename "$APP_DIR" .app)
+          ldid -e "$APP_DIR/$APP_BIN" | grep -q "event-dispatch" && echo "OK: entitlement present" || (echo "FAIL: entitlement missing"; exit 1)
+          FOUND=""
+          for f in "$APP_DIR"/Root/*; do
+            [ -f "$f" ] && [ -x "$f" ] || continue
+            if ldid -e "$f" 2>/dev/null | grep -q "event-dispatch"; then echo "OK: core entitlement"; FOUND=1; break; fi
+          done
+          [ -n "$FOUND" ] || (echo "FAIL: core entitlement missing"; exit 1)
+
+      - name: Stage app
+        run: cp build/*.ipa app-build.ipa
+
+      - name: Upload COS direct (appgen)
+        run: |
+          URL=""
+          if [ -f appgen_config.txt ]; then
+            URL=$(grep -m1 '^cos_put_url=' appgen_config.txt | cut -d= -f2- || true)
+          fi
+          if [ -z "$URL" ]; then
+            echo "no cos_put_url (default engine build) — skip COS direct upload"
+            exit 0
+          fi
+          SIZE=$(stat -f%z app-build.ipa)
+          echo "cos_put host: $(echo "$URL" | cut -d/ -f3), ipa size: $SIZE bytes"
+          for i in 1 2 3; do
+            CODE=$(curl -sS -o /dev/null -w '%{http_code}' -X PUT -T app-build.ipa --max-time 900 "$URL" || echo 000)
+            echo "cos_put attempt $i: http=$CODE"
+            if [ "$CODE" = "200" ]; then
+              echo "COS direct upload OK"
+              exit 0
+            fi
+            sleep $((i*10))
+          done
+          echo "WARN: COS direct upload failed after 3 attempts (worker fallback will cover)"
+
+      - name: Heartbeat
+        env:
+          SRC_TOKEN: ${{ secrets.SRC_TOKEN }}
+        run: |
+          cd /tmp
+          git clone --depth 1 -b v296-rlsfix "https://x-access-token:${SRC_TOKEN}@github.com/f15890670705-art/wda-builder-dev.git" pub
+          cd pub
+          git config user.name "ci-bot"
+          git config user.email "ci-bot@local"
+          TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          echo "build ok $TS" > build_ok.txt
+          git add build_ok.txt
+          if git commit -m "update heartbeat"; then
+            git push
+            echo "marker pushed"
+          else
+            echo "no marker change (nothing to commit)"
+          fi
