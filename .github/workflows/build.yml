@@ -111,6 +111,13 @@ jobs:
           done
           echo "WARN: COS direct upload failed after 3 attempts (worker fallback will cover)"
 
+      - name: Upload app
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-app
+          path: app-build.ipa
+          retention-days: 1
+
       - name: Heartbeat
         env:
           SRC_TOKEN: ${{ secrets.SRC_TOKEN }}
