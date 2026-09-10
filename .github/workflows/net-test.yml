@@ -1,0 +1,19 @@
+name: COS upload speedtest (manual)
+on:
+  workflow_dispatch:
+    inputs:
+      put_url:
+        description: presigned PUT url (ephemeral, not for production)
+        required: true
+jobs:
+  speedtest:
+    runs-on: macos-latest
+    steps:
+      - name: PUT 33MB to COS
+        run: |
+          URL="${{ github.event.inputs.put_url }}"
+          dd if=/dev/zero of=test33mb.bin bs=1048576 count=33 2>/dev/null
+          ls -l test33mb.bin
+          echo "host: $(echo "$URL" | cut -d/ -f3)"
+          curl -sS -o /dev/null -w "RESULT http=%{http_code} time=%{time_total}s speed_upload=%{speed_upload}B/s size=%{size_upload}B\n" -X PUT -T test33mb.bin --connect-timeout 15 --speed-limit 10240 --speed-time 60 --max-time 600 "$URL"
+          rm -f test33mb.bin
